@@ -108,6 +108,9 @@ PerShot 序列、Attempts、聚合状态与多数票比特。
 - 每个门一个 goroutine，门内 shot **严格串行**（一个 shot 绝不执行两次）。
 - shot 级屏障 `waitDeps`：等所有依赖门的**同一 shot** 完成（完成-开始），
   对应编译器的依赖契约。
+- 完成信号是**关闭-广播**（`shotSignal`：先写结果再 `close` 通道），不是
+  发送-接收：一个门的结果可同时喂给多个后继门（fan-out），分支/汇合/一对多
+  拓扑都能正常结束，不会卡死、不会少跑或重复跑。
 - 每门独立 `context.WithTimeout`：超时只归因于本门（`timed-out`），父 ctx
   取消级联全部门（`cancelled`）。
 
@@ -121,16 +124,49 @@ PerShot 序列、Attempts、聚合状态与多数票比特。
 | 确定性噪声抽中 | `failed` | 同上，照常执行 |
 | 校准过期/非法驱动 | `failed` + `calibration-halt`/`illegal-drive` 事件 | 同上 |
 
-关键实现点：`waitDeps` 先非阻塞探测依赖通道，避免"依赖已完成且 ctx 同时取消"
-时 Go 的 `select` 随机选中取消分支而错杀结果。每个 shot 结果写入容量 1 的
-结果通道，**每门每 shot 恰好一个结果**：没有重复计数，也没有遗漏。
+关键实现点：`waitDeps` 先非阻塞探测依赖信号，避免"依赖已完成且 ctx 同时取消"
+时 Go 的 `select` 随机选中取消分支而错杀结果。每个 (门, shot) 恰好 complete
+一次信号，**每门每 shot 恰好一个结果**：没有重复计数，也没有遗漏。
 
 ### 3.4 因果事件日志
 
 `recorder` 用互斥锁 + 原子自增 Seq 记录全部事件（complete / pulse-fail /
-measure / calibration-halt / illegal-drive / skip / not-started）。
-并发模式下事件交错顺序可能变化，但因果先后（依赖门终结事件 Seq < 后继门
-首个事件 Seq）由屏障保证，测试逐 shot 校验。
+measure / calibration-halt / illegal-drive / skip / not-started / reuse /
+resume-decision）。并发模式下事件交错顺序可能变化，但因果先后（依赖门终结
+事件 Seq < 后继门首个事件 Seq）由屏障保证，测试逐 shot 校验。
+
+### 3.5 断点续跑（可恢复的批跑）
+
+**断点**：每次运行（无论是否被中断）都在 `JobResult.Checkpoint` 中带回可续跑
+状态——每个 (门, shot) 一条记录：`Final=true` 表示已真正执行出结果
+（ok/measured/failed，确定性的，重跑结论相同），`Final=false` 表示因取消/
+超时未完成。由此"被打断没开始"与"真正执行失败"在断点层面即可区分。
+断点还记录作业指纹 `JobKey`（门集合/依赖/脉冲/shots/seed/超时的 FNV 摘要）
+与中断时的校准版本 ID。
+
+**续跑**：`ResumeSequential` / `ResumeConcurrent` 从断点接着跑，不重头再来：
+
+- 复用什么：`Final=true` 的 (门, shot) 结果直接复用，事件日志写 `reuse`
+  事件（含原状态），不再执行、不重复计数；
+- 重算什么：`Final=false` 的 shot 本次重新执行，走与首次运行完全相同的
+  执行核与确定性 PRNG，因此续跑合并后的结论与"一开始不被中断、一次性跑完"
+  **逐项一致**（每 shot 状态/比特、聚合判定、各类计数）；
+- 顺序与并发模式都可以续跑，同一断点两种模式续跑结论互相等价；
+- 续跑产出新断点，可以再被中断、再续跑（链式恢复）。
+
+**校准兼容性**（续跑前必查，不兼容绝不把新旧结果悄悄拼在一起）：
+
+| 中断期间的变化 | 判定 | 行为 |
+|---|---|---|
+| head 版本未变（含"提交后又回滚到同一个稳定版本"）且未过期 | 兼容 | 复用已完成部分，重算未完成部分；结论与最早那次一致 |
+| 版本未变但续跑时刻已过期 | 不兼容 | 拒绝，`calibration-expired`（两种策略都拒绝） |
+| head 移到新版本，`ResumeStrict` | 不兼容 | 拒绝，`calibration-changed` |
+| head 移到新版本，`ResumeRecomputeAffected` | 部分兼容 | 比较两版本**合并后的有效参数**与读出保真度（`calibration.DiffEffective`）：全局层变化→全部门重算；否则只有资源参数变化的门、测量比特保真度变化的门整门重算，未受影响门照常复用；结论与"在新校准下一次性跑完"一致 |
+| 断点版本在存储中已不存在 | 不兼容 | 拒绝，`calibration-version-lost` |
+| 断点为空/指纹与作业不符/shots 不符 | 非法输入 | 拒绝，`checkpoint-mismatch`（拿错作业或状态被明确挡掉） |
+
+每次续跑的决策（模式、版本变迁、受影响门集合、复用 shot 数）写入
+`resume-decision` 事件，日志可审计。
 
 ## 4. 可解释性与本地验证
 
@@ -168,3 +204,15 @@ go run ./cmd/qce            # 端到端演示
 | 部分失败不遗漏 | `TestPartialPulseFailureNoOmission` |
 | 过期校准执行中止 | `TestExpiredCalibrationHaltsNotSilent` |
 | 普通硬件故障归类 failed | `TestHookGenericFailureIsFailed` |
+| 顺序续跑（执行中间取消）≡ 一次性跑完 | `TestResumeSequentialCancelMiddle` |
+| 并发续跑（执行中间取消）≡ 一次性跑完 | `TestResumeConcurrentCancelMiddle` |
+| 刚开始即取消的续跑 | `TestResumeCancelAtStart` |
+| 接近结束时取消的续跑 | `TestResumeCancelNearEnd` |
+| 超时打断后的续跑 | `TestResumeAfterTimeout` |
+| 链式续跑（续跑中再次被中断） | `TestResumeChain` |
+| 拿错作业/状态续跑被拒 | `TestResumeMismatchRejected` |
+| 复杂拓扑（分支/汇合/fan-out）续跑、两模式一致、不卡住 | `TestResumeComplexTopology` |
+| 回滚到同一稳定版后续跑 ≡ 最早那次 | `TestResumeCalibrationRollbackSameStable` |
+| 新稳定版 + 严格模式拒绝续跑 | `TestResumeCalibrationNewStableStrictRejected` |
+| 新稳定版 + 重算受影响门 | `TestResumeCalibrationRecomputeAffected` |
+| 中断期间校准过期拒绝续跑 | `TestResumeCalibrationExpiredRejected` |

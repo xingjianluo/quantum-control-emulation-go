@@ -104,7 +104,52 @@ func main() {
 	recovered := exec.RunSequential(ctx, sim.Job{Schedule: sched, Shots: 10, Seed: 1, Now: t0.Add(2 * time.Hour)})
 	printCounts("恢复作业", recovered)
 
+	// 7) 断点续跑：作业跑到一半被取消，从断点接着跑，结论与一次性跑完一致。
+	full := exec.RunSequential(ctx, job)
+	intCtx, intCancel := context.WithCancel(ctx)
+	entered := 0
+	intJob := job
+	intJob.Hooks = map[string]sim.Hook{
+		"x0": func(ctx context.Context) error {
+			entered++
+			if entered == 80 { // 200 shot 跑到第 80 个时取消
+				intCancel()
+			}
+			return nil
+		},
+	}
+	partial := exec.RunConcurrent(intCtx, intJob)
+	cp := partial.Checkpoint
+	fmt.Printf("== 中断: 已完成 %d/%d 个 (门,shot)，断点校准版本=%s\n",
+		checkpointFinal(cp), 4*job.Shots, cp.CalVersion)
+	resumed, err := exec.ResumeConcurrent(ctx, intJob, cp, sim.ResumeStrict)
+	must(err)
+	fmt.Printf("== 续跑: 复用事件=%d，与一次性跑完等价=%v\n",
+		countKind(resumed, "reuse"), resumed.Equivalent(full))
+
 	_ = rebased
+}
+
+func checkpointFinal(cp *sim.Checkpoint) int {
+	n := 0
+	for _, rs := range cp.Records {
+		for _, r := range rs {
+			if r.Final {
+				n++
+			}
+		}
+	}
+	return n
+}
+
+func countKind(r *sim.JobResult, kind string) int {
+	n := 0
+	for _, ev := range r.Events {
+		if ev.Kind == kind {
+			n++
+		}
+	}
+	return n
 }
 
 func withDelayedMeasure(s *ir.Schedule) []ir.Pulse {

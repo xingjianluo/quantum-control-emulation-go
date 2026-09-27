@@ -57,12 +57,16 @@ type Event struct {
 type JobResult struct {
 	Reports []TaskReport
 	Events  []Event
+	// Checkpoint 是本次执行产出的可续跑状态：无论作业是否被中断都会生成，
+	// 中断后可用它通过 ResumeSequential/ResumeConcurrent 接着跑剩余部分。
+	Checkpoint *Checkpoint
 }
 
 // shotOutcome 是单个门在单个 shot 上的原始结果。
 type shotOutcome struct {
 	status Status
-	bit    int // 仅 status==StatusMeasured 时有意义
+	bit    int  // 仅 status==StatusMeasured 时有意义
+	reused bool // true 表示该结果复用自断点而非本次执行算出
 }
 
 // Counts 返回按门聚合的状态计数。
