@@ -57,6 +57,11 @@ type Event struct {
 type JobResult struct {
 	Reports []TaskReport
 	Events  []Event
+	// Reused 是本次执行中从检查点复用的 (门, shot) 终态结果数；
+	// Recomputed 是本次实际重新执行的 (门, shot) 数。
+	// 非续跑执行时 Reused=0、Recomputed=门数×shot数。
+	Reused     int
+	Recomputed int
 }
 
 // shotOutcome 是单个门在单个 shot 上的原始结果。

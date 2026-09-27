@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"sync/atomic"
 	"time"
 
 	"github.com/xingjianluo/quantum-control-emulation-go/internal/calibration"
@@ -103,6 +104,52 @@ func main() {
 	fmt.Printf("== 重新校准并标记稳定: %s\n", recal.ID)
 	recovered := exec.RunSequential(ctx, sim.Job{Schedule: sched, Shots: 10, Seed: 1, Now: t0.Add(2 * time.Hour)})
 	printCounts("恢复作业", recovered)
+
+	// 7) 断点续跑：作业跑到一半被取消，从检查点续跑，结论与一次性跑完一致。
+	rjob := sim.Job{ID: "demo-resume", Schedule: sched, Shots: 100, Seed: 99, Now: t0.Add(10 * time.Minute)}
+	rctx, rcancel := context.WithCancel(ctx)
+	var entries int64
+	hooks := map[string]sim.Hook{}
+	for _, g := range sched.GateIDs {
+		hooks[g] = func(context.Context) error {
+			if atomic.AddInt64(&entries, 1) == 120 { // 跑到一半取消
+				rcancel()
+			}
+			return nil
+		}
+	}
+	rjob.Hooks = hooks
+	_, cp := exec.RunResumable(rctx, rjob, true)
+	final, pending := 0, 0
+	for _, recs := range cp.Records {
+		for _, r := range recs {
+			if r.Final {
+				final++
+			} else {
+				pending++
+			}
+		}
+	}
+	fmt.Printf("== 中断: 检查点带走 已完成(终态)=%d 未完成(待重算)=%d\n", final, pending)
+	rjob.Hooks = nil // 中断条件解除
+	resumed, _, err := exec.Resume(ctx, rjob, cp, sim.ResumeStrict, true)
+	must(err)
+	ref := exec.RunConcurrent(ctx, rjob)
+	fmt.Printf("== 续跑: reused=%d recomputed=%d, 与一次性跑完一致=%v\n",
+		resumed.Reused, resumed.Recomputed, resumed.Equivalent(ref))
+
+	// 校准状态不兼容（参数漂移的新稳定版）时，strict 策略明确拒绝续跑。
+	v3, err := store.Commit(calibration.Candidate{
+		Parameters: map[string]map[string]float64{
+			calibration.GlobalLayer: {"amp": 0.56, "frequency": 5010},
+		},
+		ReadoutFid: map[int]float64{0: 0.97, 1: 0.95, 2: 0.93},
+	}, t0.Add(20*time.Minute))
+	must(err)
+	must(store.MarkStable(t0.Add(20 * time.Minute)))
+	if _, _, err := exec.Resume(ctx, rjob, cp, sim.ResumeStrict, true); err != nil {
+		fmt.Printf("== 校准已变为 %s，续跑被明确拒绝: %v\n", v3.ID, err)
+	}
 
 	_ = rebased
 }

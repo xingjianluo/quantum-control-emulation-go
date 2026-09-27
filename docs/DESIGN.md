@@ -121,9 +121,49 @@ PerShot 序列、Attempts、聚合状态与多数票比特。
 | 确定性噪声抽中 | `failed` | 同上，照常执行 |
 | 校准过期/非法驱动 | `failed` + `calibration-halt`/`illegal-drive` 事件 | 同上 |
 
-关键实现点：`waitDeps` 先非阻塞探测依赖通道，避免"依赖已完成且 ctx 同时取消"
-时 Go 的 `select` 随机选中取消分支而错杀结果。每个 shot 结果写入容量 1 的
-结果通道，**每门每 shot 恰好一个结果**：没有重复计数，也没有遗漏。
+关键实现点：`waitDeps` 先非阻塞探测依赖槽，避免"依赖已完成且 ctx 同时取消"
+时 Go 的 `select` 随机选中取消分支而错杀结果。每个 (门, shot) 的结果写入
+**广播槽**（`shotSlot`：先写结果再 `close` 就绪通道）而非消费型通道：
+一个门的结果同时喂给多个后继门（扇出）时，每个后继都能读到同一份结果，
+`close` 建立的 happens-before 保证读者看到完整结果。**每门每 shot 恰好一个
+结果**：没有重复计数，也没有遗漏；分支/汇合/扇出拓扑都能正常结束。
+
+### 3.5 可续跑执行（断点续跑）
+
+长时间批跑可能跑到一半被取消或超时。`RunResumable` 除返回聚合结果外，还返回
+一个 **Checkpoint**，把中断现场完整带走：
+
+- **已完成的部分**：每个 (门, shot) 的终态结果（`ok`/`measured`/`failed`，
+  含测量比特），标记 `Final=true`；
+- **还没开始/没跑完的部分**：`cancelled`/`timed-out` 的 shot，标记
+  `Final=false`——与真正的执行失败（`failed`，终态）严格区分；
+- **身份指纹**：JobID、脉冲计划拓扑与参数指纹（`ScheduleFP`）、Shots、Seed、
+  中断时生效校准版本的 ID 与有效参数指纹（`CalibrationFP`）。
+
+`Resume(job, checkpoint, policy, concurrent)` 的续跑流程：
+
+1. **作业身份校验**：JobID / ScheduleFP / Shots / Seed 任一不一致，返回
+   `*ResumeError{Reason: resume-mismatch-job}`，绝不执行——拿错作业或对不上
+   的状态会被明确挡掉，而不是算出一个看似正常的结果。
+2. **校准兼容性校验**：当前校准版本必须未过期，且有效参数指纹与中断点一致
+   （指纹按有效参数逐键计算，不含版本 ID）。因此：
+   - 校准未变 → 兼容；
+   - 中断期间**回滚到同一个稳定版本** → 有效参数逐键相同 → 兼容，续跑结论
+     与最早那次一次性跑完的结果一致；
+   - 过期、回滚到不同的稳定版、或提交了参数不同的新稳定版 → 不兼容。
+3. **兼容**：复用全部 `Final=true` 的结果（每个复用的 shot 记一条 `reuse`
+   事件），只为 `Final=false` 的 (门, shot) 调用执行核。由于随机数只依赖
+   `(seed, gateID, shot)` 且有效参数一致，合并后的每 shot 状态、测量比特、
+   聚合判定与计数与一次性不间断跑完**逐项一致**，不多算也不漏算。
+4. **不兼容**：`ResumeStrict` 返回
+   `*ResumeError{Reason: resume-incompatible-calibration}`，旧新结果绝不拼接；
+   `ResumeRecompute` 丢弃检查点中的全部旧结果整体重跑（`Reused=0`），结论
+   等于当前校准下的全新运行。两种处置都写入 `resume-decision` 事件，日志能
+   看出是拒绝还是重算、以及原因（过期还是参数漂移）。
+
+顺序与并发模式共用同一条复用通路：并发模式下复用结果同样通过广播槽发布，
+下游屏障与扇出语义不变。`JobResult.Reused/Recomputed` 给出本次复用与重算的
+(门, shot) 计数；`Resume` 返回的新检查点合并了全量状态，可再次用于续跑。
 
 ### 3.4 因果事件日志
 
@@ -168,3 +208,8 @@ go run ./cmd/qce            # 端到端演示
 | 部分失败不遗漏 | `TestPartialPulseFailureNoOmission` |
 | 过期校准执行中止 | `TestExpiredCalibrationHaltsNotSilent` |
 | 普通硬件故障归类 failed | `TestHookGenericFailureIsFailed` |
+| 复杂拓扑（分支/汇合/扇出）顺序≡并发、正常结束 | `TestComplexTopologySequentialConcurrentEquivalent` |
+| 开始/中间/接近结束时取消后的续跑（顺序+并发） | `TestResumeAfterCancelAtStartMiddleEnd` |
+| 超时中断后续跑；failed 终态与 cancelled/timed-out 待重算可区分 | `TestResumeAfterTimeoutConcurrent` |
+| 新稳定版/过期 → 续跑拒绝或整体重算；回滚到同一稳定版 → 兼容且结论一致 | `TestResumeRejectedOnCalibrationChange` |
+| 拿错作业/对不上的状态续跑被明确拒绝 | `TestResumeRejectsMismatchedJob` |

@@ -14,6 +14,8 @@ import (
 
 // Job 描述一次仿真作业。
 type Job struct {
+	// ID 是作业身份标识，续跑时用于校验检查点确实属于本作业。
+	ID             string
 	Schedule       *ir.Schedule
 	Shots          int
 	Seed           int64
@@ -40,16 +42,31 @@ func NewExecutor(store *calibration.Store, noise NoiseModel) *Executor {
 
 // RunSequential 顺序执行作业：按门拓扑序逐门、逐 shot 执行。
 func (e *Executor) RunSequential(ctx context.Context, j Job) *JobResult {
+	res, _ := e.runSequential(ctx, j, nil)
+	return res
+}
+
+// runSequential 是顺序执行的内部实现；prior 非空时复用其中已终态的
+// (门, shot) 结果（续跑场景），只为未完成的 shot 调用执行核。
+// 返回值附带合并后的全量 (门, shot) 结果（含复用部分），供检查点捕获。
+func (e *Executor) runSequential(ctx context.Context, j Job, prior map[string][]shotOutcome) (*JobResult, map[string][]shotOutcome) {
 	order := topoOrder(j.Schedule)
 	rec := newRecorder()
 	per := make(map[string][]shotOutcome)
 	for shot := 0; shot < j.Shots; shot++ {
 		for _, gateID := range order {
+			if oc, ok := reusableOutcome(prior, gateID, shot); ok {
+				rec.event(gateID, "reuse", fmt.Sprintf("shot=%d status=%s source=checkpoint", shot, oc.status))
+				per[gateID] = append(per[gateID], oc)
+				continue
+			}
 			oc := e.runGate(ctx, j, gateID, shot, rec)
 			per[gateID] = append(per[gateID], oc)
 		}
 	}
-	return &JobResult{Reports: aggregateReports(order, per), Events: rec.events()}
+	reused := countReusable(prior, order, j.Shots)
+	return &JobResult{Reports: aggregateReports(order, per), Events: rec.events(),
+		Reused: reused, Recomputed: len(order)*j.Shots - reused}, per
 }
 
 // RunConcurrent 并发执行作业。
@@ -59,6 +76,14 @@ func (e *Executor) RunSequential(ctx context.Context, j Job) *JobResult {
 // 串行，保证不重复、不遗漏。父 ctx 取消或单门超时只影响未开始/进行中的
 // shot，已完成的 shot 结果保留。
 func (e *Executor) RunConcurrent(ctx context.Context, j Job) *JobResult {
+	res, _ := e.runConcurrent(ctx, j, nil)
+	return res
+}
+
+// runConcurrent 是并发执行的内部实现；prior 非空时复用其中已终态的
+// (门, shot) 结果：复用结果同样写入 done 通道，下游屏障语义不变。
+// 返回值附带合并后的全量 (门, shot) 结果（含复用部分），供检查点捕获。
+func (e *Executor) runConcurrent(ctx context.Context, j Job, prior map[string][]shotOutcome) (*JobResult, map[string][]shotOutcome) {
 	order := topoOrder(j.Schedule)
 	rec := newRecorder()
 	var cancel context.CancelFunc
@@ -69,14 +94,14 @@ func (e *Executor) RunConcurrent(ctx context.Context, j Job) *JobResult {
 	}
 	defer cancel()
 
-	// done[gate][shot] 在该门该 shot 完成后写入结果（缓冲为1）。
-	// 下游据此同时判断“是否完成”与“是否因果可达”：上游被取消/超时的 shot，
-	// 后继标记为 cancelled，避免把未执行的工作计入成功。
-	done := make(map[string][]chan shotOutcome)
+	// done[gate][shot] 在该门该 shot 完成后闭合，结果先写入 slot 再 close。
+	// close 是广播语义：一个门的结果同时喂给多个后继门（扇出）时，
+	// 每个后继都能读到同一份结果，不会互相消费。
+	done := make(map[string][]*shotSlot)
 	for _, g := range order {
-		done[g] = make([]chan shotOutcome, j.Shots)
+		done[g] = make([]*shotSlot, j.Shots)
 		for s := 0; s < j.Shots; s++ {
-			done[g][s] = make(chan shotOutcome, 1)
+			done[g][s] = &shotSlot{ready: make(chan struct{})}
 		}
 	}
 	var wg sync.WaitGroup
@@ -100,27 +125,75 @@ func (e *Executor) RunConcurrent(ctx context.Context, j Job) *JobResult {
 			deps := append([]string(nil), j.Schedule.GateDeps[gateID]...)
 			sort.Strings(deps)
 			for shot := 0; shot < j.Shots; shot++ {
+				if oc, ok := reusableOutcome(prior, gateID, shot); ok {
+					outs[shot] = oc
+					rec.event(gateID, "reuse", fmt.Sprintf("shot=%d status=%s source=checkpoint", shot, oc.status))
+					completeShot(done[gateID][shot], oc)
+					continue
+				}
 				ready, abortedDep := waitDeps(ctx, done, deps, shot)
 				if !ready {
 					outs[shot] = shotOutcome{status: StatusCancelled}
 					rec.event(gateID, "skip", fmt.Sprintf("shot=%d reason=cancelled-or-timeout", shot))
-					done[gateID][shot] <- outs[shot]
+					completeShot(done[gateID][shot], outs[shot])
 					continue
 				}
 				if abortedDep != "" {
 					outs[shot] = shotOutcome{status: StatusCancelled}
 					rec.event(gateID, "skip", fmt.Sprintf("shot=%d reason=upstream-aborted dep=%s", shot, abortedDep))
-					done[gateID][shot] <- outs[shot]
+					completeShot(done[gateID][shot], outs[shot])
 					continue
 				}
 				oc := e.runGate(gateCtx, j, gateID, shot, rec)
 				outs[shot] = oc
-				done[gateID][shot] <- oc
+				completeShot(done[gateID][shot], oc)
 			}
 		}()
 	}
 	wg.Wait()
-	return &JobResult{Reports: aggregateReports(order, per), Events: rec.events()}
+	reused := countReusable(prior, order, j.Shots)
+	return &JobResult{Reports: aggregateReports(order, per), Events: rec.events(),
+		Reused: reused, Recomputed: len(order)*j.Shots - reused}, per
+}
+
+// reusableOutcome 返回先验结果中可复用的终态结果。
+// 只有 ok/measured/failed 是终态；cancelled/timed-out 表示被打断时未跑完，
+// 必须重新执行，与真正的执行失败严格区分。
+func reusableOutcome(prior map[string][]shotOutcome, gateID string, shot int) (shotOutcome, bool) {
+	if prior == nil {
+		return shotOutcome{}, false
+	}
+	ocs, ok := prior[gateID]
+	if !ok || shot >= len(ocs) {
+		return shotOutcome{}, false
+	}
+	oc := ocs[shot]
+	if !isFinalStatus(oc.status) {
+		return shotOutcome{}, false
+	}
+	return oc, true
+}
+
+// isFinalStatus 判断状态是否为终态（可复用）。
+func isFinalStatus(s Status) bool {
+	return s == StatusOK || s == StatusMeasured || s == StatusFailed
+}
+
+// countReusable 统计先验结果中对本作业实际可复用的终态 (门, shot) 数。
+func countReusable(prior map[string][]shotOutcome, order []string, shots int) int {
+	if prior == nil {
+		return 0
+	}
+	n := 0
+	for _, g := range order {
+		ocs := prior[g]
+		for shot := 0; shot < shots && shot < len(ocs); shot++ {
+			if isFinalStatus(ocs[shot].status) {
+				n++
+			}
+		}
+	}
+	return n
 }
 
 // runGate 执行单个门在单个 shot 上的仿真。它是顺序/并发共用的同一执行核，
@@ -211,31 +284,45 @@ func (e *Executor) runGate(ctx context.Context, j Job, gateID string, shot int, 
 
 // ---- 辅助 ----
 
+// shotSlot 是单个 (门, shot) 结果的广播槽：结果写入后 close 就绪通道，
+// 任意数量的下游门都能读到同一份结果（扇出安全），且 close 建立
+// happens-before，读者看到的 oc 一定是写完整的。
+type shotSlot struct {
+	ready chan struct{}
+	oc    shotOutcome
+}
+
+// completeShot 写入结果并广播给所有等待者；每个槽恰好调用一次。
+func completeShot(slot *shotSlot, oc shotOutcome) {
+	slot.oc = oc
+	close(slot.ready)
+}
+
 // waitDeps 等待某 shot 的所有依赖门完成。
 //
 // 返回值：
 //   - ready=false: 父 ctx 被取消/超时，未能确认全部依赖完成；
 //   - abortedDep!="": 依赖已完成但为 cancelled/timed-out，本 shot 因果不可达。
 //
-// 先用非阻塞 select 判定已就绪的依赖通道，避免“通道已就绪且 ctx 同时取消”
+// 先用非阻塞 select 判定已就绪的依赖槽，避免“依赖已完成且 ctx 同时取消”
 // 时 Go 的 select 随机选中 ctx 分支而错杀本可执行的 shot。
-func waitDeps(ctx context.Context, done map[string][]chan shotOutcome, deps []string, shot int) (ready bool, abortedDep string) {
+func waitDeps(ctx context.Context, done map[string][]*shotSlot, deps []string, shot int) (ready bool, abortedDep string) {
 	for _, d := range deps {
-		ch, ok := done[d]
-		if !ok || shot >= len(ch) {
+		slots, ok := done[d]
+		if !ok || shot >= len(slots) {
 			return false, ""
 		}
-		var oc shotOutcome
+		slot := slots[shot]
 		select {
-		case oc = <-ch[shot]:
+		case <-slot.ready:
 		default:
 			select {
-			case oc = <-ch[shot]:
+			case <-slot.ready:
 			case <-ctx.Done():
 				return false, ""
 			}
 		}
-		if oc.status == StatusCancelled || oc.status == StatusTimedOut {
+		if oc := slot.oc; oc.status == StatusCancelled || oc.status == StatusTimedOut {
 			return true, d
 		}
 	}
