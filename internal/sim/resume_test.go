@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"sort"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -361,14 +362,16 @@ func TestResumeRejectedOnCalibrationChange(t *testing.T) {
 		if !errors.As(err, &rerr) {
 			t.Fatalf("expected *ResumeError, got %v", err)
 		}
-		if rerr.Reason != ResumeIncompatibleCalibration {
-			t.Fatalf("reason=%s want %s", rerr.Reason, ResumeIncompatibleCalibration)
+		if rerr.Reason != ResumeCalibrationChanged {
+			t.Fatalf("reason=%s want %s", rerr.Reason, ResumeCalibrationChanged)
 		}
 		t.Logf("verdict: resume rejected, no old/new results merged: %v", rerr)
 	})
 
-	t.Run("new-stable-version recompute reruns all", func(t *testing.T) {
+	t.Run("global-change recompute reruns every gate", func(t *testing.T) {
 		e, s, cp, j2 := setup(t)
+		// 全局层 amp 变化会合并进每一个资源 → 每个门的门级指纹都变化，
+		// 范围重算此时等价于全部重算（复用必须为 0，且不得混入旧结果）。
 		if _, err := s.Commit(calibration.Candidate{
 			Parameters: map[string]map[string]float64{calibration.GlobalLayer: {"amp": 0.55, "frequency": 5050}},
 			ReadoutFid: map[int]float64{0: 0.9, 1: 0.9, 2: 0.9},
@@ -381,15 +384,25 @@ func TestResumeRejectedOnCalibrationChange(t *testing.T) {
 
 		res, _, err := e.Resume(context.Background(), j2, cp, ResumeRecompute, false)
 		if err != nil {
-			t.Fatalf("recompute policy must not reject: %v", err)
+			t.Fatalf("recompute policy must not reject a usable calibration: %v", err)
 		}
-		logResume(t, "recompute-all", res, nil)
+		logResume(t, "recompute-scoped-global", res, nil)
 		if res.Reused != 0 {
-			t.Fatalf("incompatible calibration must discard all old results, reused=%d", res.Reused)
+			t.Fatalf("global calibration change affects every gate, reused=%d want 0", res.Reused)
+		}
+		// 每个门都应有一条 recompute-scope 标记。
+		scoped := map[string]bool{}
+		for _, ev := range res.Events {
+			if ev.Kind == "recompute-scope" {
+				scoped[ev.GateID] = true
+			}
+		}
+		if len(scoped) != len(sched.GateIDs) {
+			t.Fatalf("global change must scope every gate, got %d/%d: %v", len(scoped), len(sched.GateIDs), scoped)
 		}
 		// 整体重算的结论 == 当前校准下全新一次性运行。
 		ref := e.RunSequential(context.Background(), j2)
-		assertEquivalentToReference(t, "recompute-all", res, ref)
+		assertEquivalentToReference(t, "recompute-scoped-global", res, ref)
 		sawDecision := false
 		for _, ev := range res.Events {
 			if ev.Kind == "resume-decision" {
@@ -398,7 +411,7 @@ func TestResumeRejectedOnCalibrationChange(t *testing.T) {
 			}
 		}
 		if !sawDecision {
-			t.Fatal("expected resume-decision event explaining recompute-all")
+			t.Fatal("expected resume-decision event explaining recompute scope")
 		}
 	})
 
@@ -406,15 +419,38 @@ func TestResumeRejectedOnCalibrationChange(t *testing.T) {
 		e, _, cp, j2 := setup(t)
 		j2.Now = base.Add(2 * time.Hour) // 超过 1h TTL
 		t.Logf("input: resume at %s with ttl=1h (checkpoint calibration id=%s)", j2.Now, cp.CalibrationID)
-		_, _, err := e.Resume(context.Background(), j2, cp, ResumeStrict, false)
+		res, _, err := e.Resume(context.Background(), j2, cp, ResumeStrict, false)
 		var rerr *ResumeError
 		if !errors.As(err, &rerr) {
 			t.Fatalf("expected *ResumeError, got %v", err)
 		}
-		if rerr.Reason != ResumeIncompatibleCalibration {
-			t.Fatalf("reason=%s want %s", rerr.Reason, ResumeIncompatibleCalibration)
+		if rerr.Reason != ResumeCalibrationUnavailable {
+			t.Fatalf("reason=%s want %s", rerr.Reason, ResumeCalibrationUnavailable)
 		}
-		t.Logf("verdict: expired calibration rejected distinctly: %v", rerr)
+		if res != nil {
+			t.Fatalf("expired calibration must not return an all-failed normal result, got %+v", res)
+		}
+		t.Logf("verdict: expired calibration rejected distinctly (strict): %v", rerr)
+	})
+
+	t.Run("expired calibration recompute also rejects", func(t *testing.T) {
+		e, _, cp, j2 := setup(t)
+		j2.Now = base.Add(2 * time.Hour) // 超过 1h TTL
+		t.Logf("input: resume at %s with ttl=1h, policy=recompute (checkpoint calibration id=%s)",
+			j2.Now, cp.CalibrationID)
+		res, _, err := e.Resume(context.Background(), j2, cp, ResumeRecompute, true)
+		var rerr *ResumeError
+		if !errors.As(err, &rerr) {
+			t.Fatalf("expected *ResumeError, got %v", err)
+		}
+		if rerr.Reason != ResumeCalibrationUnavailable {
+			t.Fatalf("reason=%s want %s (policy must not override unavailability)",
+				rerr.Reason, ResumeCalibrationUnavailable)
+		}
+		if res != nil {
+			t.Fatalf("expired calibration must not return an all-failed normal result, got %+v", res)
+		}
+		t.Logf("verdict: expired calibration rejected distinctly even under recompute: %v", rerr)
 	})
 
 	t.Run("rollback to same stable stays compatible", func(t *testing.T) {
@@ -482,6 +518,383 @@ func TestResumeRejectsMismatchedJob(t *testing.T) {
 				t.Fatalf("rejected resume must not produce a result, got %+v", res.Reports)
 			}
 			t.Logf("verdict: mismatched resume explicitly rejected: %v", rerr)
+		})
+	}
+}
+
+// commitQ1Change 在中断期间提交并稳定化“只改 q1.ctrl 资源层”的新版本：
+// 全局层保持不变，因此只有触及 q1 资源的门的门级指纹会变化。
+func commitQ1Change(t *testing.T, s *calibration.Store, at time.Time) {
+	t.Helper()
+	if _, err := s.Commit(calibration.Candidate{
+		Parameters: map[string]map[string]float64{
+			calibration.GlobalLayer: {"amp": 0.5, "frequency": 5000},
+			"q1.ctrl":               {"amp": 0.42},
+		},
+		ReadoutFid: map[int]float64{0: 0.9, 1: 0.9, 2: 0.9},
+		Note:       "q1 only recalibrated during interruption",
+	}, at); err != nil {
+		t.Fatalf("commit q1 change: %v", err)
+	}
+	if err := s.MarkStable(at); err != nil {
+		t.Fatalf("mark stable: %v", err)
+	}
+}
+
+// gatesOnQ1 是复杂拓扑中实际触及 q1.ctrl 资源的门集合（含 CNOT 的靶端）。
+func gatesOnQ1() map[string]bool {
+	return map[string]bool{"a1": true, "b0": true, "c1": true}
+}
+
+func TestResumeScopedRecomputePartialCalibrationChange(t *testing.T) {
+	base := time.Date(2026, 9, 24, 10, 30, 0, 0, time.UTC)
+	sched := complexSchedule(t)
+	const shots = 12
+	total := int64(len(sched.GateIDs) * shots)
+	q1Gates := gatesOnQ1()
+
+	for _, concurrent := range []bool{false, true} {
+		mode := "sequential"
+		if concurrent {
+			mode = "concurrent"
+		}
+		name := "q1-scoped/" + mode
+		t.Run(mode, func(t *testing.T) {
+			s := newStore(t, time.Hour, 3)
+			e := NewExecutor(s, DefaultNoise())
+
+			ctx, cancel := context.WithCancel(context.Background())
+			hooks, _ := cancelHooks(sched.GateIDs, total/2, cancel)
+			j := Job{ID: "job-" + name, Schedule: sched, Shots: shots, Seed: 41, Now: base, Hooks: hooks}
+			logJob(t, name+" interrupted", j)
+			_, cp := e.RunResumable(ctx, j, concurrent)
+			assertCheckpointInvariant(t, name, cp)
+
+			// 中断期间只有 q1.ctrl 的资源层校准发生变化。
+			commitQ1Change(t, s, base.Add(time.Minute))
+
+			// 中断点上 q1 门有多少终态结果：这些结果严格禁止被复用。
+			q1Final := 0
+			for g, recs := range cp.Records {
+				if !q1Gates[g] {
+					continue
+				}
+				for _, r := range recs {
+					if r.Final {
+						q1Final++
+					}
+				}
+			}
+			if q1Final == 0 {
+				t.Fatalf("test setup: expected some completed q1 outcomes at interrupt point, got 0")
+			}
+			t.Logf("[%s] q1-affected gates=%v, completed-but-must-discard outcomes=%d",
+				name, mapKeys(q1Gates), q1Final)
+
+			// strict 策略：部分校准变化同样明确拒绝（原因是 changed，而不是 unavailable）。
+			jStrict := Job{ID: j.ID, Schedule: sched, Shots: shots, Seed: 41, Now: base.Add(2 * time.Minute)}
+			rej, _, err := e.Resume(context.Background(), jStrict, cp, ResumeStrict, concurrent)
+			var rerr *ResumeError
+			if !errors.As(err, &rerr) {
+				t.Fatalf("[%s] strict must reject partial calibration change, got %v", name, err)
+			}
+			if rerr.Reason != ResumeCalibrationChanged {
+				t.Fatalf("[%s] reason=%s want %s", name, rerr.Reason, ResumeCalibrationChanged)
+			}
+			if rej != nil {
+				t.Fatalf("[%s] rejected resume must not return any result", name)
+			}
+			t.Logf("[%s] strict rejection detail: %v", name, rerr)
+
+			// recompute 策略：只重算受影响门，未受影响门的终态结果继续复用。
+			j2 := Job{ID: j.ID, Schedule: sched, Shots: shots, Seed: 41, Now: base.Add(2 * time.Minute)}
+			res, cp2, err := e.Resume(context.Background(), j2, cp, ResumeRecompute, concurrent)
+			if err != nil {
+				t.Fatalf("[%s] scoped recompute must not reject: %v", name, err)
+			}
+			logResume(t, name+" scoped-resumed", res, cp2)
+
+			// 记账：重算数 = q1 门全部 shot + 其余门中断时未跑完的 shot；
+			// 复用数 = 未受影响门的终态 shot。没有任何一个 q1 门结果来自检查点。
+			var wantRecomputed, wantReused int
+			for g, recs := range cp.Records {
+				for _, r := range recs {
+					if q1Gates[g] {
+						wantRecomputed++
+					} else if r.Final {
+						wantReused++
+					} else {
+						wantRecomputed++
+					}
+				}
+			}
+			if res.Recomputed != wantRecomputed || res.Reused != wantReused {
+				t.Fatalf("[%s] accounting: reused=%d(recomputed=%d), want reused=%d recomputed=%d",
+					name, res.Reused, res.Recomputed, wantReused, wantRecomputed)
+			}
+			if res.Reused+res.Recomputed != int(total) {
+				t.Fatalf("[%s] accounting broken: %d+%d != %d", name, res.Reused, res.Recomputed, total)
+			}
+			for _, ev := range res.Events {
+				if ev.Kind == "reuse" && q1Gates[ev.GateID] {
+					t.Fatalf("[%s] gate %s outcome produced under old calibration must not be reused",
+						name, ev.GateID)
+				}
+				if ev.Kind == "recompute-scope" && !q1Gates[ev.GateID] {
+					t.Fatalf("[%s] gate %s was scoped for recompute despite unaffected calibration",
+						name, ev.GateID)
+				}
+			}
+			scoped := map[string]bool{}
+			for _, ev := range res.Events {
+				if ev.Kind == "recompute-scope" {
+					scoped[ev.GateID] = true
+				}
+			}
+			if !reflect.DeepEqual(scoped, q1Gates) {
+				t.Fatalf("[%s] scope=%v want exactly %v", name, mapKeys(scoped), mapKeys(q1Gates))
+			}
+
+			// 与“当前校准下一次性不间断跑完”逐项一致（顺序与并发都必须）。
+			var ref *JobResult
+			if concurrent {
+				ref = e.RunConcurrent(context.Background(), j2)
+			} else {
+				ref = e.RunSequential(context.Background(), j2)
+			}
+			assertEquivalentToReference(t, name, res, ref)
+
+			// 新检查点必须整体盖成当前校准：门级指纹与当前版本一致，全部终态。
+			v, verr := s.Current(j2.Now)
+			if verr != nil {
+				t.Fatal(verr)
+			}
+			for _, g := range sched.GateIDs {
+				if cp2.GateCalibration[g] != gateCalibrationFP(sched, g, v) {
+					t.Fatalf("[%s] new checkpoint gate %s not stamped with current calibration", name, g)
+				}
+				for _, r := range cp2.Records[g] {
+					if !r.Final {
+						t.Fatalf("[%s] gate %s still pending after scoped resume", name, g)
+					}
+				}
+			}
+		})
+	}
+}
+
+func mapKeys(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func TestResumeCompatibleCalibrationReusesAll(t *testing.T) {
+	base := time.Date(2026, 9, 24, 10, 30, 0, 0, time.UTC)
+	sched := complexSchedule(t)
+	const shots = 10
+	total := int64(len(sched.GateIDs) * shots)
+
+	cases := []struct {
+		name    string
+		prepare func(t *testing.T, s *calibration.Store)
+	}{
+		{
+			name: "rollback-to-same-stable",
+			prepare: func(t *testing.T, s *calibration.Store) {
+				// 中断期间 head 移到参数不同的新版本，随后回滚到同一稳定版。
+				if _, err := s.Commit(calibration.Candidate{
+					Parameters: map[string]map[string]float64{calibration.GlobalLayer: {"amp": 0.55, "frequency": 5050}},
+					ReadoutFid: map[int]float64{0: 0.9, 1: 0.9, 2: 0.9},
+				}, base.Add(time.Minute)); err != nil {
+					t.Fatalf("commit: %v", err)
+				}
+				if _, err := s.Rollback(base.Add(2 * time.Minute)); err != nil {
+					t.Fatalf("rollback: %v", err)
+				}
+			},
+		},
+		{
+			name: "different-version-id-equal-effective-params",
+			prepare: func(t *testing.T, s *calibration.Store) {
+				// 新版本 ID 不同，但有效参数/保真度与中断点逐键一致 → 门级指纹全等。
+				if _, err := s.Commit(calibration.Candidate{
+					Parameters: map[string]map[string]float64{calibration.GlobalLayer: {"amp": 0.5, "frequency": 5000}},
+					ReadoutFid: map[int]float64{0: 0.9, 1: 0.9, 2: 0.9},
+					Note:       "byte-equal effective parameters, new version id",
+				}, base.Add(time.Minute)); err != nil {
+					t.Fatalf("commit equal-effective version: %v", err)
+				}
+				if err := s.MarkStable(base.Add(time.Minute)); err != nil {
+					t.Fatalf("mark stable: %v", err)
+				}
+			},
+		},
+	}
+	for _, tc := range cases {
+		for _, concurrent := range []bool{false, true} {
+			mode := "sequential"
+			if concurrent {
+				mode = "concurrent"
+			}
+			name := tc.name + "/" + mode
+			t.Run(name, func(t *testing.T) {
+				s := newStore(t, time.Hour, 3)
+				e := NewExecutor(s, DefaultNoise())
+
+				ctx, cancel := context.WithCancel(context.Background())
+				hooks, _ := cancelHooks(sched.GateIDs, total/2, cancel)
+				j := Job{ID: "job-" + name, Schedule: sched, Shots: shots, Seed: 63, Now: base, Hooks: hooks}
+				_, cp := e.RunResumable(ctx, j, concurrent)
+				assertCheckpointInvariant(t, name, cp)
+
+				tc.prepare(t, s)
+
+				j2 := Job{ID: j.ID, Schedule: sched, Shots: shots, Seed: 63, Now: base.Add(3 * time.Minute)}
+				res, cp2, err := e.Resume(context.Background(), j2, cp, ResumeStrict, concurrent)
+				if err != nil {
+					t.Fatalf("[%s] compatible calibration must resume under strict: %v", name, err)
+				}
+				logResume(t, name, res, cp2)
+
+				// 全部终态结果被复用；没有任何 recompute-scope 标记。
+				finalRecords := 0
+				for _, recs := range cp.Records {
+					for _, r := range recs {
+						if r.Final {
+							finalRecords++
+						}
+					}
+				}
+				if res.Reused != finalRecords {
+					t.Fatalf("[%s] reused=%d want %d (all final records)", name, res.Reused, finalRecords)
+				}
+				if res.Reused+res.Recomputed != int(total) {
+					t.Fatalf("[%s] accounting broken: %d+%d != %d", name, res.Reused, res.Recomputed, total)
+				}
+				for _, ev := range res.Events {
+					if ev.Kind == "recompute-scope" {
+						t.Fatalf("[%s] compatible calibration must not scope any gate: %s", name, ev.Note)
+					}
+				}
+				var ref *JobResult
+				if concurrent {
+					ref = e.RunConcurrent(context.Background(), j2)
+				} else {
+					ref = e.RunSequential(context.Background(), j2)
+				}
+				assertEquivalentToReference(t, name, res, ref)
+			})
+		}
+	}
+}
+
+func TestResumeScopedRecomputeFidelityOnly(t *testing.T) {
+	base := time.Date(2026, 9, 24, 10, 30, 0, 0, time.UTC)
+	sched := complexSchedule(t)
+	const shots = 8
+	total := int64(len(sched.GateIDs) * shots)
+
+	for _, concurrent := range []bool{false, true} {
+		mode := "sequential"
+		if concurrent {
+			mode = "concurrent"
+		}
+		name := "fid1-scoped/" + mode
+		t.Run(mode, func(t *testing.T) {
+			s := newStore(t, time.Hour, 3)
+			e := NewExecutor(s, DefaultNoise())
+
+			ctx, cancel := context.WithCancel(context.Background())
+			hooks, _ := cancelHooks(sched.GateIDs, total/2, cancel)
+			j := Job{ID: "job-" + name, Schedule: sched, Shots: shots, Seed: 67, Now: base, Hooks: hooks}
+			_, cp := e.RunResumable(ctx, j, concurrent)
+
+			// 只把 q1 的读出保真度改了：控制门不读保真度，只有测量 q1 的 m1 受影响。
+			if _, err := s.Commit(calibration.Candidate{
+				Parameters: map[string]map[string]float64{calibration.GlobalLayer: {"amp": 0.5, "frequency": 5000}},
+				ReadoutFid: map[int]float64{0: 0.9, 1: 0.61, 2: 0.9},
+			}, base.Add(time.Minute)); err != nil {
+				t.Fatalf("commit fid change: %v", err)
+			}
+			if err := s.MarkStable(base.Add(time.Minute)); err != nil {
+				t.Fatalf("mark stable: %v", err)
+			}
+
+			j2 := Job{ID: j.ID, Schedule: sched, Shots: shots, Seed: 67, Now: base.Add(2 * time.Minute)}
+			res, _, err := e.Resume(context.Background(), j2, cp, ResumeRecompute, concurrent)
+			if err != nil {
+				t.Fatalf("[%s] resume: %v", name, err)
+			}
+			logResume(t, name, res, nil)
+
+			scoped := map[string]bool{}
+			for _, ev := range res.Events {
+				if ev.Kind == "recompute-scope" {
+					scoped[ev.GateID] = true
+				}
+			}
+			if len(scoped) != 1 || !scoped["m1"] {
+				t.Fatalf("[%s] only m1 (measure q1) should be scoped, got %v", name, mapKeys(scoped))
+			}
+			for _, ev := range res.Events {
+				if ev.Kind == "reuse" && ev.GateID == "m1" {
+					t.Fatalf("[%s] m1 measured under old fidelity must not be reused", name)
+				}
+			}
+			var ref *JobResult
+			if concurrent {
+				ref = e.RunConcurrent(context.Background(), j2)
+			} else {
+				ref = e.RunSequential(context.Background(), j2)
+			}
+			assertEquivalentToReference(t, name, res, ref)
+		})
+	}
+}
+
+func TestResumeCalibrationUnavailableMissingFidelity(t *testing.T) {
+	base := time.Date(2026, 9, 24, 10, 30, 0, 0, time.UTC)
+	sched := complexSchedule(t)
+	const shots = 6
+	s := newStore(t, time.Hour, 3)
+	e := NewExecutor(s, DefaultNoise())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	hooks, _ := cancelHooks(sched.GateIDs, 20, cancel)
+	j := Job{ID: "job-missing-fid", Schedule: sched, Shots: shots, Seed: 37, Now: base, Hooks: hooks}
+	_, cp := e.RunResumable(ctx, j, false)
+
+	// 中断期间换上一份缺少 q1 读出保真度的版本：版本本身未过期，但执行核
+	// 取 CurrentFor(measure.bus, q1) 必然失败，属于“当前校准不可用”。
+	if _, err := s.Commit(calibration.Candidate{
+		Parameters: map[string]map[string]float64{calibration.GlobalLayer: {"amp": 0.5, "frequency": 5000}},
+		ReadoutFid: map[int]float64{0: 0.9, 2: 0.9}, // 故意缺 q1
+	}, base.Add(time.Minute)); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	if err := s.MarkStable(base.Add(time.Minute)); err != nil {
+		t.Fatalf("mark stable: %v", err)
+	}
+	j2 := Job{ID: j.ID, Schedule: sched, Shots: shots, Seed: 37, Now: base.Add(2 * time.Minute)}
+
+	for _, policy := range []ResumePolicy{ResumeStrict, ResumeRecompute} {
+		t.Run(policy.String(), func(t *testing.T) {
+			res, _, err := e.Resume(context.Background(), j2, cp, policy, false)
+			var rerr *ResumeError
+			if !errors.As(err, &rerr) {
+				t.Fatalf("policy=%s: expected *ResumeError, got %v", policy, err)
+			}
+			if rerr.Reason != ResumeCalibrationUnavailable {
+				t.Fatalf("policy=%s: reason=%s want %s", policy, rerr.Reason, ResumeCalibrationUnavailable)
+			}
+			if res != nil {
+				t.Fatalf("policy=%s: unusable calibration must not produce a result", policy)
+			}
+			t.Logf("verdict: missing-fidelity rejected distinctly under %s: %v", policy, rerr)
 		})
 	}
 }

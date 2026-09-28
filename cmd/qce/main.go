@@ -148,7 +148,33 @@ func main() {
 	must(err)
 	must(store.MarkStable(t0.Add(20 * time.Minute)))
 	if _, _, err := exec.Resume(ctx, rjob, cp, sim.ResumeStrict, true); err != nil {
-		fmt.Printf("== 校准已变为 %s，续跑被明确拒绝: %v\n", v3.ID, err)
+		fmt.Printf("== 校准已变为 %s，strict 续跑被明确拒绝: %v\n", v3.ID, err)
+	}
+
+	// 只重算受影响门：换上相对当前稳定版 v2 只改 q1.ctrl 资源层的新版本
+	// （全局层与 q0 有效参数保持不变）。sched 中只有 x1 与 cx（靶端 q1）
+	// 触及 q1；x0、mz 的已完成结果继续复用。
+	v4At := t0.Add(2*time.Hour + 5*time.Minute)
+	v4, err := store.Commit(calibration.Candidate{
+		Parameters: map[string]map[string]float64{
+			calibration.GlobalLayer: {"amp": 0.51, "frequency": 5002},
+			"q0.ctrl":               {"amp": 0.49},
+			"q1.ctrl":               {"amp": 0.42},
+		},
+		ReadoutFid: map[int]float64{0: 0.97, 1: 0.95, 2: 0.93},
+	}, v4At)
+	must(err)
+	must(store.MarkStable(v4At))
+	scopedJob := sim.Job{ID: rjob.ID, Schedule: sched, Shots: 100, Seed: 99, Now: v4At}
+	scoped, _, err := exec.Resume(ctx, scopedJob, cp, sim.ResumeRecompute, true)
+	must(err)
+	fmt.Printf("== 仅 q1 校准变为 %s：按范围重算 reused=%d recomputed=%d，仅受影响门重跑\n",
+		v4.ID, scoped.Reused, scoped.Recomputed)
+
+	// 校准过期时，无论哪种恢复策略都必须拒绝（不会返回整体 failed 的正常结果）。
+	expiredJob := sim.Job{ID: rjob.ID, Schedule: sched, Shots: 100, Seed: 99, Now: t0.Add(4 * time.Hour)}
+	if _, _, err := exec.Resume(ctx, expiredJob, cp, sim.ResumeRecompute, true); err != nil {
+		fmt.Printf("== 校准时已过期，recompute 续跑同样被拒绝: %v\n", err)
 	}
 
 	_ = rebased

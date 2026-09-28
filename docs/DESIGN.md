@@ -138,32 +138,57 @@ PerShot 序列、Attempts、聚合状态与多数票比特。
 - **还没开始/没跑完的部分**：`cancelled`/`timed-out` 的 shot，标记
   `Final=false`——与真正的执行失败（`failed`，终态）严格区分；
 - **身份指纹**：JobID、脉冲计划拓扑与参数指纹（`ScheduleFP`）、Shots、Seed、
-  中断时生效校准版本的 ID 与有效参数指纹（`CalibrationFP`）。
+  中断时生效校准版本的 ID、全量有效参数指纹（`CalibrationFP`），以及每个门的
+  **门级校准指纹**（`GateCalibration`，只含该门实际读取的资源有效参数与测量
+  比特保真度，用于按门判定复用/重算范围）。
 
-`Resume(job, checkpoint, policy, concurrent)` 的续跑流程：
+`Resume(job, checkpoint, policy, concurrent)` 的续跑流程按以下顺序判定，
+任一步拒绝都**不执行、不返回结果、不把旧结果拼进新结果**：
 
-1. **作业身份校验**：JobID / ScheduleFP / Shots / Seed 任一不一致，返回
-   `*ResumeError{Reason: resume-mismatch-job}`，绝不执行——拿错作业或对不上
-   的状态会被明确挡掉，而不是算出一个看似正常的结果。
-2. **校准兼容性校验**：当前校准版本必须未过期，且有效参数指纹与中断点一致
-   （指纹按有效参数逐键计算，不含版本 ID）。因此：
-   - 校准未变 → 兼容；
-   - 中断期间**回滚到同一个稳定版本** → 有效参数逐键相同 → 兼容，续跑结论
-     与最早那次一次性跑完的结果一致；
-   - 过期、回滚到不同的稳定版、或提交了参数不同的新稳定版 → 不兼容。
-3. **兼容**：复用全部 `Final=true` 的结果（每个复用的 shot 记一条 `reuse`
-   事件），只为 `Final=false` 的 (门, shot) 调用执行核。由于随机数只依赖
-   `(seed, gateID, shot)` 且有效参数一致，合并后的每 shot 状态、测量比特、
-   聚合判定与计数与一次性不间断跑完**逐项一致**，不多算也不漏算。
-4. **不兼容**：`ResumeStrict` 返回
-   `*ResumeError{Reason: resume-incompatible-calibration}`，旧新结果绝不拼接；
-   `ResumeRecompute` 丢弃检查点中的全部旧结果整体重跑（`Reused=0`），结论
-   等于当前校准下的全新运行。两种处置都写入 `resume-decision` 事件，日志能
-   看出是拒绝还是重算、以及原因（过期还是参数漂移）。
+1. **作业身份校验**：JobID / ScheduleFP / Shots / Seed 任一不一致，或检查点
+   记录残缺（缺门、每门记录数 ≠ Shots），返回
+   `*ResumeError{Reason: resume-mismatch-job}`。
+2. **校准可用性校验（与恢复策略无关）**：取当前版本失败（超过 TTL、不存在），
+   或当前版本对本作业的**真实读取路径**不可用（某测量比特缺读出保真度等，
+   预检逐门复刻 `runGate` 对 `CurrentFor` 的调用），一律返回
+   `*ResumeError{Reason: resume-calibration-unavailable}`。此时执行核只会把
+   每个 shot 判成 `failed`，因此即使是 `recompute` 策略也必须拒绝恢复，
+   绝不会产出一个“整体失败”的正常结果。
+3. **门级校准兼容性判定**：检查点为每个门记录**门级校准指纹**
+   `GateCalibration[gate]`，其纳入项恰好是 `runGate` 执行该门时读取的校准量——
+   门内各脉冲所在资源的合并有效参数（全局层继承 + 资源层覆盖）与测量脉冲
+   对应比特的读出保真度；门没有用到的资源/比特不参与。恢复时用当前版本
+   逐门重算指纹并比对，据此把门划成“受影响/未受影响”：
+   - **没有任何门变化**：兼容。回滚到同一个稳定版本（版本 ID 相同）与
+     “版本 ID 不同但有效参数逐键一致”都落在这一类——指纹不含版本 ID。
+     全部终态结果复用，只重跑 `Final=false` 的 `(门, shot)`。
+   - **存在受影响门 + `strict`**：返回
+     `*ResumeError{Reason: resume-calibration-changed}`，错误明细列出受影响
+     门（确定性拓扑序），明确区别于 `resume-calibration-unavailable` 与
+     `resume-mismatch-job`。
+   - **存在受影响门 + `recompute`（按范围重算）**：受影响门的检查点记录
+     **整门丢弃**（该门旧结果无论终态与否都不进入先验，全部 shot 重算），
+     未受影响门的终态结果照常复用、未完成的 shot 照常补跑。不会因为任意
+     校准变化就从头重跑整个作业，也不会把不同校准下产生的结果混在同一门里。
 
-顺序与并发模式共用同一条复用通路：并发模式下复用结果同样通过广播槽发布，
-下游屏障与扇出语义不变。`JobResult.Reused/Recomputed` 给出本次复用与重算的
-(门, shot) 计数；`Resume` 返回的新检查点合并了全量状态，可再次用于续跑。
+**为什么跨门复用是安全的**：每个 `(seed, gateID, shot)` 的随机数独立确定，
+门结果只依赖本门的有效校准；上游门换校准后重算出的终态结果，经并发广播槽/
+顺序循环喂给下游，与“当前校准下一次性不间断跑完”完全一致。未受影响门复用
+的旧结果与其在全新参考运行中会产生的结果逐 shot 相同。因此范围重算合并后的
+每 shot 状态、测量比特、聚合判定与计数与一次性跑完**逐项一致**，顺序与并发
+两种模式都有测试断言。
+
+**日志可审计**：每次恢复产生一条 `resume-decision` 事件（reuse /
+recompute-scoped，含两个版本 ID、指纹、reused/recomputed 计数）；每个受影响
+门一条 `recompute-scope` 事件（旧/新门级指纹、该门全部 shot 重算）；每个被
+复用的 shot 一条 `reuse` 事件。拒绝恢复时原因写在 `ResumeError` 明细里
+（过期时刻、底层校准错误、受影响门列表都可见）。
+
+`Resume` 返回的新检查点合并全量状态并整体盖上**当前**校准的版本 ID、全量
+指纹与门级指纹，可再次用于续跑。
+
+`JobResult.Reused/Recomputed` 给出本次复用与重算的 (门, shot) 计数，二者之和
+恒等于门数 × Shots，不多算也不漏算。
 
 ### 3.4 因果事件日志
 
@@ -212,4 +237,8 @@ go run ./cmd/qce            # 端到端演示
 | 开始/中间/接近结束时取消后的续跑（顺序+并发） | `TestResumeAfterCancelAtStartMiddleEnd` |
 | 超时中断后续跑；failed 终态与 cancelled/timed-out 待重算可区分 | `TestResumeAfterTimeoutConcurrent` |
 | 新稳定版/过期 → 续跑拒绝或整体重算；回滚到同一稳定版 → 兼容且结论一致 | `TestResumeRejectedOnCalibrationChange` |
+| 过期校准时 strict 与 recompute **都**拒绝（原因 `resume-calibration-unavailable`，不返回整体失败结果） | `TestResumeRejectedOnCalibrationChange`（expired 子用例）、`TestResumeCalibrationUnavailableMissingFidelity` |
+| 校准只影响部分门（q1 资源层）→ strict 拒绝（`resume-calibration-changed`），recompute 只重算 a1/b0/c1，其余门复用；顺序与并发都与不间断运行逐项一致 | `TestResumeScopedRecomputePartialCalibrationChange` |
+| 仅读出保真度变化 → 只有对应测量门（m1）进入重算范围 | `TestResumeScopedRecomputeFidelityOnly` |
+| 回滚到同一稳定版、或版本不同但有效参数逐键一致 → 全部复用、结论一致（顺序+并发） | `TestResumeCompatibleCalibrationReusesAll` |
 | 拿错作业/对不上的状态续跑被明确拒绝 | `TestResumeRejectsMismatchedJob` |
