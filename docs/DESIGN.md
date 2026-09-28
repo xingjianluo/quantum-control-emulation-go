@@ -145,25 +145,60 @@ PerShot 序列、Attempts、聚合状态与多数票比特。
 1. **作业身份校验**：JobID / ScheduleFP / Shots / Seed 任一不一致，返回
    `*ResumeError{Reason: resume-mismatch-job}`，绝不执行——拿错作业或对不上
    的状态会被明确挡掉，而不是算出一个看似正常的结果。
-2. **校准兼容性校验**：当前校准版本必须未过期，且有效参数指纹与中断点一致
-   （指纹按有效参数逐键计算，不含版本 ID）。因此：
-   - 校准未变 → 兼容；
-   - 中断期间**回滚到同一个稳定版本** → 有效参数逐键相同 → 兼容，续跑结论
-     与最早那次一次性跑完的结果一致；
-   - 过期、回滚到不同的稳定版、或提交了参数不同的新稳定版 → 不兼容。
-3. **兼容**：复用全部 `Final=true` 的结果（每个复用的 shot 记一条 `reuse`
-   事件），只为 `Final=false` 的 (门, shot) 调用执行核。由于随机数只依赖
-   `(seed, gateID, shot)` 且有效参数一致，合并后的每 shot 状态、测量比特、
-   聚合判定与计数与一次性不间断跑完**逐项一致**，不多算也不漏算。
-4. **不兼容**：`ResumeStrict` 返回
-   `*ResumeError{Reason: resume-incompatible-calibration}`，旧新结果绝不拼接；
-   `ResumeRecompute` 丢弃检查点中的全部旧结果整体重跑（`Reused=0`），结论
-   等于当前校准下的全新运行。两种处置都写入 `resume-decision` 事件，日志能
-   看出是拒绝还是重算、以及原因（过期还是参数漂移）。
+2. **校准可用性校验（先于一切策略选择）**：当前版本必须存在且未过期，且作业
+   测量门要用到的每个比特都必须有读出保真度。不满足时返回
+   `*ResumeError{Reason: resume-calibration-unavailable}`，**无论 strict 还是
+   recompute 策略都明确拒绝恢复**：既不执行，也不把检查点里的旧结果拼成一份
+   “整体都 failed”的正常结果。这与下面的“校准已变化”严格区分。
+3. **作业范围内逐键比较有效参数**：检查点携带中断时本作业实际用到的各资源层
+   （全局层 `*`、各 `qN.ctrl`、`measure.bus`，均为合并全局层后的有效值）与
+   各测量比特读出保真度的快照。恢复时只在脉冲计划实际用到的资源/比特范围内
+   逐键比较，因此：
+   - **完全一致 → 兼容并复用**：校准未变、回滚到同一个稳定版本、换了版本但
+     有效参数逐键相同、或只改了作业从不使用的资源/比特，都判定为无差异，
+     复用全部终态结果，结论与最早那次一次性跑完逐项一致；
+   - **存在差异**：返回结构化差异（哪些资源的哪些参数键、哪个比特的保真度
+     变了）。strict 策略返回
+     `*ResumeError{Reason: resume-calibration-changed}`，旧新结果绝不拼接；
+     recompute 策略**按范围重算**，不做全量重跑（见第 4 点）。
+4. **按范围重算（recompute 策略，仅重算受影响任务）**：差异被映射为必须
+   重算的门集合，映射规则与执行核取值一一对应：
+   - 全局层 `*` 参数变化 → 作业的全部门；
+   - 控制资源 `qN.ctrl` 参数变化 → 拥有该资源脉冲的门（CNOT 两端脉冲分别
+     归属 `qN.ctrl`，哪一端变只影响拥有该端的门）；
+   - 测量资源 `measure.bus` 参数变化 → 所有测量门；
+   - 比特 N 的读出保真度变化 → 仅作用于比特 N 的测量门。
+
+   受影响门的**全部 shot**（包括中断前已是 `failed` 的终态结果）一律丢弃重算，
+   绝不沿用旧校准下产生的结果；其他门的终态结果继续复用，被打断未完成的
+   （`cancelled`/`timed-out`）shot 本来就要重算。由于执行核对某门某 shot 的
+   判定只取决于该门自身脉冲资源的有效参数/该比特保真度与 `(seed, gateID,
+   shot)`，而不复用上游的数值（上游 `failed` 也不阻断下游），所以“不受影响
+   门复用 + 受影响门重算”的合并结论，与**当前校准下一次不间断跑完逐项一致**，
+   且不会把两份不同校准的结果混在同一门里。若检查点缺少校准快照（中断时校准
+   已不可用），无法证明任何旧结果的前提，保守地把全部门判为受影响。
+5. **可观察性**：每次恢复都写一条 `resume-decision` 事件，取值为
+   `decision=reuse`（全量复用）/ `decision=recompute-scoped`（按范围重算，
+   列出 `changed=[…]` 与 `affected-gates=[…]`）；拒绝时原因写在
+   `ResumeError.Detail` 中。每个被复用的 shot 另有一条 `reuse` 事件，与实际
+   重算产生的 `complete/measure/pulse-fail/…` 事件一一可区分；日志因此能看出
+   哪些 shot 复用、哪些重算，以及拒绝恢复的具体原因。
 
 顺序与并发模式共用同一条复用通路：并发模式下复用结果同样通过广播槽发布，
 下游屏障与扇出语义不变。`JobResult.Reused/Recomputed` 给出本次复用与重算的
-(门, shot) 计数；`Resume` 返回的新检查点合并了全量状态，可再次用于续跑。
+(门, shot) 计数且二者之和恒等于 门数×Shots；`Resume` 返回的新检查点以当前
+校准为基线合并了全量状态，可再次用于续跑。
+
+### 3.5.1 三种可区分的拒绝原因
+
+| Reason | 触发条件 |
+|---|---|
+| `resume-mismatch-job` | JobID / 拓扑指纹 / Shots / Seed 与检查点不一致（拿错作业） |
+| `resume-calibration-unavailable` | 当前校准过期、不存在，或缺少作业所需比特的读出保真度；**两种恢复策略都拒绝** |
+| `resume-calibration-changed` | 当前校准可用，但作业范围内有效参数/保真度相对中断点发生了变化；strict 拒绝，recompute 按范围重算 |
+
+三种原因互不重叠：作业对不上、校准根本不可用、校准可用但内容变了，调用方
+可以据此分别处置（换检查点 / 先重新校准再续 / 显式接受按范围重算）。
 
 ### 3.4 因果事件日志
 
@@ -211,5 +246,10 @@ go run ./cmd/qce            # 端到端演示
 | 复杂拓扑（分支/汇合/扇出）顺序≡并发、正常结束 | `TestComplexTopologySequentialConcurrentEquivalent` |
 | 开始/中间/接近结束时取消后的续跑（顺序+并发） | `TestResumeAfterCancelAtStartMiddleEnd` |
 | 超时中断后续跑；failed 终态与 cancelled/timed-out 待重算可区分 | `TestResumeAfterTimeoutConcurrent` |
-| 新稳定版/过期 → 续跑拒绝或整体重算；回滚到同一稳定版 → 兼容且结论一致 | `TestResumeRejectedOnCalibrationChange` |
+| 新稳定版（全局变化）strict 拒绝 / recompute 全部门重算；过期两种策略都拒绝（顺序） | `TestResumeRejectedOnCalibrationChange` |
+| 过期校准两种恢复策略都拒绝且不出拼装结果（并发） | `TestResumeExpiredRejectsBothPoliciesConcurrent` |
+| 仅 q1.ctrl 参数变化：strict 拒绝；recompute 只重算 a1/b0/c1，其余复用（顺序+并发，逐项对齐不间断运行） | `TestResumeScopedRecomputeControlResource` |
+| 仅比特 1 读出保真度变化：只重算测量门 m1，m0 复用，新旧比特不混杂（顺序+并发） | `TestResumeScopedRecomputeReadoutFidelity` |
+| 改动不涉及作业的比特保真度 / 换版本但有效参数相同 → strict 也兼容并全量复用 | `TestResumeUnrelatedOrEquivalentCalibrationFullyReuses` |
+| 回滚到同一稳定版仍兼容、全量复用、结论与最早运行一致（顺序+并发） | `TestResumeRejectedOnCalibrationChange/rollback_to_same_stable_stays_compatible` |
 | 拿错作业/对不上的状态续跑被明确拒绝 | `TestResumeRejectsMismatchedJob` |

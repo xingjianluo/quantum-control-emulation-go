@@ -361,13 +361,13 @@ func TestResumeRejectedOnCalibrationChange(t *testing.T) {
 		if !errors.As(err, &rerr) {
 			t.Fatalf("expected *ResumeError, got %v", err)
 		}
-		if rerr.Reason != ResumeIncompatibleCalibration {
-			t.Fatalf("reason=%s want %s", rerr.Reason, ResumeIncompatibleCalibration)
+		if rerr.Reason != ResumeCalibrationChanged {
+			t.Fatalf("reason=%s want %s", rerr.Reason, ResumeCalibrationChanged)
 		}
 		t.Logf("verdict: resume rejected, no old/new results merged: %v", rerr)
 	})
 
-	t.Run("new-stable-version recompute reruns all", func(t *testing.T) {
+	t.Run("global-change recompute reruns all gates", func(t *testing.T) {
 		e, s, cp, j2 := setup(t)
 		if _, err := s.Commit(calibration.Candidate{
 			Parameters: map[string]map[string]float64{calibration.GlobalLayer: {"amp": 0.55, "frequency": 5050}},
@@ -383,13 +383,15 @@ func TestResumeRejectedOnCalibrationChange(t *testing.T) {
 		if err != nil {
 			t.Fatalf("recompute policy must not reject: %v", err)
 		}
-		logResume(t, "recompute-all", res, nil)
+		logResume(t, "recompute-global", res, nil)
+		// 全局层参数变化触及每个门：所有终态旧结果都必须重算，只允许复用
+		// 不存在（终态记录在中断点前均来自同一全局层，全部失效）。
 		if res.Reused != 0 {
-			t.Fatalf("incompatible calibration must discard all old results, reused=%d", res.Reused)
+			t.Fatalf("global calibration change must invalidate every gate, reused=%d", res.Reused)
 		}
-		// 整体重算的结论 == 当前校准下全新一次性运行。
+		// 重算结论 == 当前校准下全新一次性运行（顺序模式每 shot 都实际执行）。
 		ref := e.RunSequential(context.Background(), j2)
-		assertEquivalentToReference(t, "recompute-all", res, ref)
+		assertEquivalentToReference(t, "recompute-global", res, ref)
 		sawDecision := false
 		for _, ev := range res.Events {
 			if ev.Kind == "resume-decision" {
@@ -398,52 +400,90 @@ func TestResumeRejectedOnCalibrationChange(t *testing.T) {
 			}
 		}
 		if !sawDecision {
-			t.Fatal("expected resume-decision event explaining recompute-all")
+			t.Fatal("expected resume-decision event explaining recompute scope")
 		}
 	})
 
-	t.Run("expired calibration strict rejects", func(t *testing.T) {
-		e, _, cp, j2 := setup(t)
-		j2.Now = base.Add(2 * time.Hour) // 超过 1h TTL
-		t.Logf("input: resume at %s with ttl=1h (checkpoint calibration id=%s)", j2.Now, cp.CalibrationID)
-		_, _, err := e.Resume(context.Background(), j2, cp, ResumeStrict, false)
-		var rerr *ResumeError
-		if !errors.As(err, &rerr) {
-			t.Fatalf("expected *ResumeError, got %v", err)
+	t.Run("expired calibration rejects under both policies", func(t *testing.T) {
+		for _, policy := range []ResumePolicy{ResumeStrict, ResumeRecompute} {
+			e, _, cp, j2 := setup(t)
+			j2.Now = base.Add(2 * time.Hour) // 超过 1h TTL
+			name := "strict"
+			if policy == ResumeRecompute {
+				name = "recompute"
+			}
+			t.Run(name, func(t *testing.T) {
+				t.Logf("input: resume at %s with ttl=1h policy=%s (checkpoint id=%s)",
+					j2.Now, name, cp.CalibrationID)
+				res, _, err := e.Resume(context.Background(), j2, cp, policy, false)
+				var rerr *ResumeError
+				if !errors.As(err, &rerr) {
+					t.Fatalf("expected *ResumeError, got res=%v err=%v", res, err)
+				}
+				if rerr.Reason != ResumeCalibrationUnavailable {
+					t.Fatalf("reason=%s want %s", rerr.Reason, ResumeCalibrationUnavailable)
+				}
+				if res != nil {
+					t.Fatalf("expired calibration must not yield a (all-failed) result, got %+v", res.Reports)
+				}
+				t.Logf("verdict: expired calibration rejected distinctly under %s: %v", name, rerr)
+			})
 		}
-		if rerr.Reason != ResumeIncompatibleCalibration {
-			t.Fatalf("reason=%s want %s", rerr.Reason, ResumeIncompatibleCalibration)
-		}
-		t.Logf("verdict: expired calibration rejected distinctly: %v", rerr)
 	})
 
 	t.Run("rollback to same stable stays compatible", func(t *testing.T) {
-		e, s, cp, j2 := setup(t)
-		// 中断期间：提交新版本（head 移走），随后回滚到同一个稳定版本。
-		if _, err := s.Commit(calibration.Candidate{
-			Parameters: map[string]map[string]float64{calibration.GlobalLayer: {"amp": 0.55, "frequency": 5050}},
-			ReadoutFid: map[int]float64{0: 0.9, 1: 0.9, 2: 0.9},
-		}, base.Add(time.Minute)); err != nil {
-			t.Fatalf("commit: %v", err)
-		}
-		rb, err := s.Rollback(base.Add(2 * time.Minute))
-		if err != nil {
-			t.Fatalf("rollback: %v", err)
-		}
-		t.Logf("input: rolled back to %s; checkpoint calibration id=%s", rb.ID, cp.CalibrationID)
-		if rb.ID != cp.CalibrationID {
-			t.Fatalf("test setup: rollback target %s != checkpoint calibration %s", rb.ID, cp.CalibrationID)
-		}
+		for _, concurrent := range []bool{false, true} {
+			mode := "sequential"
+			if concurrent {
+				mode = "concurrent"
+			}
+			t.Run(mode, func(t *testing.T) {
+				e, s, cp, j2 := setup(t)
+				// 中断期间：提交新版本（head 移走），随后回滚到同一个稳定版本。
+				if _, err := s.Commit(calibration.Candidate{
+					Parameters: map[string]map[string]float64{calibration.GlobalLayer: {"amp": 0.55, "frequency": 5050}},
+					ReadoutFid: map[int]float64{0: 0.9, 1: 0.9, 2: 0.9},
+				}, base.Add(time.Minute)); err != nil {
+					t.Fatalf("commit: %v", err)
+				}
+				rb, err := s.Rollback(base.Add(2 * time.Minute))
+				if err != nil {
+					t.Fatalf("rollback: %v", err)
+				}
+				t.Logf("input: rolled back to %s; checkpoint calibration id=%s", rb.ID, cp.CalibrationID)
+				if rb.ID != cp.CalibrationID {
+					t.Fatalf("test setup: rollback target %s != checkpoint calibration %s", rb.ID, cp.CalibrationID)
+				}
 
-		j2.Now = base.Add(3 * time.Minute)
-		res, _, err := e.Resume(context.Background(), j2, cp, ResumeStrict, false)
-		if err != nil {
-			t.Fatalf("rollback to same stable must stay compatible: %v", err)
+				j2.Now = base.Add(3 * time.Minute)
+				res, _, err := e.Resume(context.Background(), j2, cp, ResumeStrict, concurrent)
+				if err != nil {
+					t.Fatalf("rollback to same stable must stay compatible: %v", err)
+				}
+				logResume(t, "rollback-compatible/"+mode, res, nil)
+				// 有效参数与中断点逐键一致：全部终态结果都应复用，没有门被判重算。
+				wantReused := 0
+				for _, recs := range cp.Records {
+					for _, r := range recs {
+						if r.Final {
+							wantReused++
+						}
+					}
+				}
+				if res.Reused != wantReused {
+					t.Fatalf("rollback must reuse every final outcome: reused=%d want %d", res.Reused, wantReused)
+				}
+				// 与最早那次（中断点校准状态下）一次性跑完的结论一致。
+				var ref *JobResult
+				refJob := Job{ID: j2.ID, Schedule: sched, Shots: shots, Seed: 31, Now: base}
+				if concurrent {
+					ref = e.RunConcurrent(context.Background(), refJob)
+				} else {
+					ref = e.RunSequential(context.Background(), refJob)
+				}
+				assertEquivalentToReference(t, "rollback-compatible/"+mode, res, ref)
+			})
 		}
-		logResume(t, "rollback-compatible", res, nil)
-		// 与最早那次（中断点校准状态下）一次性跑完的结论一致。
-		ref := e.RunSequential(context.Background(), Job{ID: j2.ID, Schedule: sched, Shots: shots, Seed: 31, Now: base})
-		assertEquivalentToReference(t, "rollback-compatible", res, ref)
 	})
 }
 

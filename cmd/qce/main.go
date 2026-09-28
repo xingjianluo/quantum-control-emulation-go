@@ -151,6 +151,69 @@ func main() {
 		fmt.Printf("== 校准已变为 %s，续跑被明确拒绝: %v\n", v3.ID, err)
 	}
 
+	// 8) 校准过期时：两种恢复策略都必须拒绝，而不是拼出整体失败的“正常”结果。
+	expJob := sim.Job{ID: "demo-resume-expired", Schedule: sched, Shots: 10, Seed: 99, Now: t0.Add(10 * time.Minute)}
+	ectx, ecancel := context.WithCancel(ctx)
+	var eentries int64
+	ehooks := map[string]sim.Hook{}
+	for _, g := range sched.GateIDs {
+		ehooks[g] = func(context.Context) error {
+			if atomic.AddInt64(&eentries, 1) == 12 {
+				ecancel()
+			}
+			return nil
+		}
+	}
+	expJob.Hooks = ehooks
+	_, ecp := exec.RunResumable(ectx, expJob, true)
+	expJob.Hooks = nil
+	expJob.Now = t0.Add(2 * time.Hour) // v3 此刻也已过期
+	if _, _, err := exec.Resume(ctx, expJob, ecp, sim.ResumeRecompute, true); err != nil {
+		fmt.Printf("== 校准时过期，recompute 也被明确拒绝（不出整体失败结果）: %v\n", err)
+	}
+
+	// 9) 中断期间只重标定 q0.ctrl：按范围重算，只动拥有 q0.ctrl 脉冲的门
+	// （x0、cx；测量保真度与其他资源不变），其余继续复用。
+	sjob := sim.Job{ID: "demo-resume-scoped", Schedule: sched, Shots: 60, Seed: 123, Now: t0.Add(20 * time.Minute)}
+	sctx, scancel := context.WithCancel(ctx)
+	var sentries int64
+	shooks := map[string]sim.Hook{}
+	for _, g := range sched.GateIDs {
+		shooks[g] = func(context.Context) error {
+			if atomic.AddInt64(&sentries, 1) == 70 {
+				scancel()
+			}
+			return nil
+		}
+	}
+	sjob.Hooks = shooks
+	_, scp := exec.RunResumable(sctx, sjob, true)
+	// 中断发生后、恢复之前，才提交只影响 q0.ctrl 的新稳定版。
+	if _, err := store.Commit(calibration.Candidate{
+		Parameters: map[string]map[string]float64{
+			calibration.GlobalLayer: {"amp": 0.56, "frequency": 5010},
+			"q0.ctrl":               {"amp": 0.37},
+		},
+		ReadoutFid: map[int]float64{0: 0.97, 1: 0.95, 2: 0.93},
+	}, t0.Add(30*time.Minute)); err != nil {
+		must(err)
+	}
+	must(store.MarkStable(t0.Add(30 * time.Minute)))
+	sjob.Hooks = nil
+	sjob.Now = t0.Add(30 * time.Minute)
+	sres, _, err := exec.Resume(ctx, sjob, scp, sim.ResumeRecompute, true)
+	must(err)
+	sref := exec.RunConcurrent(ctx, sjob)
+	var sdecision string
+	for _, ev := range sres.Events {
+		if ev.Kind == "resume-decision" {
+			sdecision = ev.Note
+		}
+	}
+	fmt.Printf("== 仅 q0.ctrl 变化，按范围重算: reused=%d recomputed=%d, 与不间断一致=%v\n",
+		sres.Reused, sres.Recomputed, sres.Equivalent(sref))
+	fmt.Printf("   决策: %s\n", sdecision)
+
 	_ = rebased
 }
 
